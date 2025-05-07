@@ -1,101 +1,211 @@
 import requests
 from bs4 import BeautifulSoup
-from openpyxl import Workbook
 import os
 from time import sleep
 import csv
+from urllib.parse import urljoin
 
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+}
 
-headers = {"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"}
-
-
-def retry_request(url, headers, timeout=30, max_retries=3):
-    for _ in range(max_retries):
+def retry_request(url, max_retries=3):
+    for attempt in range(max_retries):
         try:
-            response = requests.get(url, headers=headers, timeout=timeout)
+            response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
-            print(f"Ошибка: {e}. Повтор соединения...")
+            print(f"Помилка ({attempt+1}/{max_retries}): {e}")
             sleep(5)
-    raise Exception(f"Не получилось после {max_retries} попыток.")
+    return None
 
+def parse_item(item):
+    try:
+        # Назва товару
+        name_tag = item.find('span', class_='cgname')
+        name = name_tag.text.strip() if name_tag else 'Невідома назва'
 
-data_name = []
-def card_links(url):
-    response = retry_request(url, headers=headers)
-    soup = BeautifulSoup(response.content, "html.parser")
-    print("===page card===", url)
-    # sleep(0.5)
+        # Ціна
+        price_element = item.find('span', class_='cgprice')
+        price_text = price_element.text.replace('грн', '').replace('.', '').replace(',', '.').strip() if price_element else '0'
+        try:
+            price = float(price_text)
+        except:
+            price = 0.0
 
+        # Наявність
+        quantity_true = item.find('span', class_='quantity_true')
+        quantity_false = item.find('span', class_='quantity_false')
+        if quantity_true:
+            availability = quantity_true.text.strip()
+        elif quantity_false:
+            availability = quantity_false.text.strip()
+        else:
+            availability = 'Невідомо'
 
-    if soup.find("div", class_="right catGroupsItems").find("a", class_="catalogueGroup subgrp"):
-        for el in soup.find("div", class_="right catGroupsItems").find_all("a", class_="catalogueGroup subgrp"):
-            links = 'https://fordfocus.com.ua/' + el["href"]
-            card_links(links)
-            # print(links)
+        # Бренд, стан, артикул
+        brand, status, code = "Невідомий бренд", "Невідомий стан", "Артикул не вказаний"
+
+        # Отримаємо всі елементи властивостей (і <span>, і <div>)
+        props = item.select('.cgproperty .property_value')
+
+        for prop in props:
+            value = prop.text.strip().lower()
+            # Логіка визначення стану
+            if 'нова' in value or 'new' in value:
+                status = "Нова"
+            elif 'б/в' in value or 'бу' in value or 'вживана' in value:
+                status = "Б/В"
+            # Логіка визначення бренду
+            elif value.isalpha() and brand == "Невідомий бренд":
+                brand = value.upper()
+            # Логіка визначення коду (якщо це щось схоже на артикул)
+            elif code == "Артикул не вказаний" and len(value) < 20:
+                code = prop.text.strip()
+
+        item_data = {
+            'brand': brand,
+            'code': code,
+            'name': name,
+            'price': round(price * 0.98, 2),  # 2% знижка
+            'availability': availability,
+            'used': status
+        }
+
+        print(f"Товар: {item_data}")  # Для дебагу
+        return item_data
+
+    except Exception as e:
+        print(f"Помилка парсингу товару: {e}")
+        return None
+
+def parse_products_page(url):
+    data = []
+    page = 1
+
+    while True:
+        current_url = f"{url}?page={page}" if page > 1 else url
+        print(f"  Обробляємо сторінку товарів: {current_url}")
+
+        response = retry_request(current_url)
+        if not response:
+            print(f"Не вдалося отримати сторінку товарів {current_url}")
+            break
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Парсимо товари на сторінці
+        items = soup.find_all('div', class_='catalogueGroupItem')
+        if not items:
+            print("  Товари не знайдені")
+            break
+
+        for item in items:
+            item_data = parse_item(item)
+            if item_data:
+                data.append(item_data)
+
+        # Пошук пагінації
+        pagination = soup.find("div", class_="pagination")
+        if pagination:
+            next_button = None
+            links = pagination.find_all("a")
+            for link in links:
+                if link.text.strip() == '>':
+                    next_button = link
+                    break
+
+            if next_button:
+                page += 1
+                sleep(1)
+                continue  # є наступна сторінка — переходимо далі
+            else:
+                break  # немає кнопки ">" — кінець пагінації
+        else:
+            break  # пагінація відсутня повністю
+
+    return data
+
+def parse_subcategories(base_url):
+    data = []
+
+    response = retry_request(base_url)
+    if not response:
+        print(f"Не вдалося отримати сторінку категорії {base_url}")
+        return data
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # Спочатку перевіряємо, чи є підкатегорії
+    subcategories = soup.select('div.catalogueGroupList a.catalogueGroup.subgrp')
+    if subcategories:
+        print(f"Знайдено {len(subcategories)} підкатегорій")
+        for subcat in subcategories:
+            subcat_url = urljoin(base_url, subcat['href'])
+            print(f"Обробляємо підкатегорію: {subcat_url}")
+            data.extend(parse_subcategories(subcat_url))  # Рекурсивний виклик
+            sleep(1)
     else:
-        for el in soup.find("div", class_="catalogueGroupItems").find_all("div", class_="catalogueGroupItem"):
-            # link = 'https://fordfocus.com.ua/' + el.find('a')["href"]
+        # Якщо підкатегорій немає - парсимо товари
+        print("Підкатегорій не знайдено, переходимо до товарів")
+        data.extend(parse_products_page(base_url))
 
-            if el.find('span', class_="cgquantity").find('span', class_="quantity_true"):
-                available = el.find('span', class_="cgquantity").find('span', class_="quantity_true").text.strip()
-            else:
-                continue
-            # print(available)
+    return data
 
-            code = el.find('span', class_="cgproperty").find('div', class_="property_value").text.strip()
-            if code == '':
-                continue
+def parse_model(url):
+    print(f"\nПочинаємо обробку моделі: {url}")
+    return parse_subcategories(url)
 
-            if len(el.find('span', class_="cgproperty").find_all('span', class_="property_value")) == 2:
-                brand = el.find('span', class_="cgproperty").find_all('span', class_="property_value")[1].text.strip()
-                new_or_not = el.find('span', class_="cgproperty").find_all('span', class_="property_value")[0].text.strip()
-                if new_or_not == 'Б/У':
-                    new_or_not = 1
-                else:
-                    new_or_not = ''
-            
-            name = el.find('span', class_="cgname").text.strip()
-            # print(name)
+def main():
+    base_url = "https://fordfocus.com.ua/"
+    output_file = os.path.join(os.path.dirname(__file__), 'fordfocus.csv')
 
-            price = el.find('span', class_="cgprice")
-            if not price.find('span', class_="old_price"):
-                final_price = round(float(price.text.strip().replace(' грн.', '')) - (float(price.text.strip().replace(' грн.', '')) * 0.02), 2)
-            else:
-                price.find('span', class_="old_price").decompose()
-                if float(price.text.strip().replace(' грн.', '')) == 0:
-                    return
-                final_price = round(float(price.text.strip().replace(' грн.', '')) - (float(price.text.strip().replace(' грн.', '')) * 0.02), 2)
-            # print(name, '>>>', final_price)
+    print("Починаємо парсинг сайту ford-focus.com.ua")
 
-            data_name.append([brand, code, name, final_price, available, new_or_not])
-    
-        if soup.find("link", rel="next"):
-            next_pages = soup.find("link", rel="next")["href"]
-            card_links(next_pages)
+    try:
+        # Отримуємо головну сторінку для пошуку категорій
+        response = retry_request(base_url)
+        if not response:
+            raise Exception("Не вдалося отримати головну сторінку")
 
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-# card_links(('https://fordfocus.com.ua/optika-zerkala-775'))
+        # Знаходимо всі моделі авто
+        models = soup.select('div.under_h1 a.catalogue_group_main')
+        if not models:
+            raise Exception("Не знайдено жодної моделі авто")
 
+        model_urls = [urljoin(base_url, model['href']) for model in models
+                      if 'rozprodaj' not in model['href'].lower() and '#' not in model['href']]
 
-def group_links(url):
-    response = retry_request(url, headers=headers)
-    soup = BeautifulSoup(response.content, "html.parser")
-    # print("<<<page col>>>", url)
+        print(f"Знайдено {len(model_urls)} моделей для обробки")
 
-    for el in soup.find("div", class_="under_h1").find_all("a", class_="catalogueGroup"):
-        links = 'https://fordfocus.com.ua' + el["href"]
-        if '/rozprodaj' in links:
-            continue
-        card_links(links)
-        # print(links)
+        all_data = []
+        for url in model_urls:
+            model_data = parse_model(url)
+            all_data.extend(model_data)
+            print(f"Додано {len(model_data)} товарів з цієї моделі")
+            sleep(2)  # Пауза між моделями
 
+        # Записуємо результати у CSV
+        with open(output_file, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Бренд', 'Код', 'Назва', 'Ціна', 'Кількість'])
+            for item in all_data:
+                if item['availability'].strip().lower() == 'є у наявності':
+                    writer.writerow([
+                        item['brand'],
+                        item['code'],
+                        item['name'],
+                        item['price'],
+                        1
+                ])
 
-group_links("https://fordfocus.com.ua/")
+        print(f"\nПарсинг завершено. Збережено {len(all_data)} товарів у файл {output_file}")
 
+    except Exception as e:
+        print(f"Критична помилка: {e}")
 
-column_name = [["Бренд", "Код", "Название", "Цена", "Наличие", "Б/У"]]
-with open(os.path.dirname(__file__) + '/fordfocus.csv', 'w', encoding='utf-8', newline='') as file:
-    writer = csv.writer(file, quoting=csv.QUOTE_ALL)
-    writer.writerows(column_name + data_name)
+if __name__ == "__main__":
+    main()
